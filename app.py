@@ -8,10 +8,15 @@ import subprocess
 import ctypes
 from ctypes import wintypes
 import tkinter as tk
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 import customtkinter as ctk
 import pystray
 import winreg
+import urllib.request
+import urllib.error
+
+VERSION = "1.0.0"
+
 
 # ==============================================================================
 # WINDOWS API DECLARATIONS
@@ -488,11 +493,19 @@ class AstroModeApp(ctk.CTk):
         
         # Configure window
         self.title("AstroMode Dashboard")
-        self.geometry("380x600")
+        self.geometry("380x620")
         self.overrideredirect(True) # Frameless window
         self.configure(fg_color=self.color_bg)
         self.attributes("-topmost", True) # Keep on top when active
         self.attributes("-alpha", 1.0)    # Fully solid background
+
+        # Set window icon
+        if os.path.exists(ICON_PATH):
+            try:
+                self.icon_img = ImageTk.PhotoImage(file=ICON_PATH)
+                self.wm_iconphoto(True, self.icon_img)
+            except Exception as e:
+                print(f"Failed to set window icon: {e}")
 
         # Build UI layout
         self.create_widgets()
@@ -510,6 +523,9 @@ class AstroModeApp(ctk.CTk):
         self.running = True
         self.power_thread = threading.Thread(target=self.monitor_power_loop, daemon=True)
         self.power_thread.start()
+
+        # Check for updates in the background on startup
+        self.check_for_updates_background(silent=True)
 
     def init_win32_hooks(self):
         # Retrieve HWND of the Tkinter root window safely using wm_frame()
@@ -777,7 +793,7 @@ class AstroModeApp(ctk.CTk):
         self.chk_usb.pack(anchor="w", padx=10, pady=(5, 8))
 
         # 3. Bottom Panel (Master Astro Switch, Power Status, and Autolaunch Option)
-        bottom_frame = ctk.CTkFrame(self, height=95, corner_radius=0, fg_color=self.color_card, border_width=1, border_color=self.color_border)
+        bottom_frame = ctk.CTkFrame(self, height=110, corner_radius=0, fg_color=self.color_card, border_width=1, border_color=self.color_border)
         bottom_frame.pack(fill="x", side="bottom")
         bottom_frame.pack_propagate(False)
         
@@ -788,7 +804,7 @@ class AstroModeApp(ctk.CTk):
             font=ctk.CTkFont(size=11), 
             text_color=self.color_text_muted
         )
-        self.lbl_power_status.place(x=16, y=10)
+        self.lbl_power_status.place(x=16, y=14)
         
         self.lbl_active_status = ctk.CTkLabel(
             bottom_frame, 
@@ -796,7 +812,7 @@ class AstroModeApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold"), 
             text_color=self.color_text_muted
         )
-        self.lbl_active_status.place(x=16, y=32)
+        self.lbl_active_status.place(x=16, y=40)
         
         # Auto-launch Startup Checkbox
         self.chk_autolaunch = ctk.CTkCheckBox(
@@ -805,11 +821,26 @@ class AstroModeApp(ctk.CTk):
             fg_color=self.color_accent, hover_color=self.color_accent_hover,
             height=18, width=18, command=self.on_autolaunch_toggled
         )
-        self.chk_autolaunch.place(x=16, y=58)
+        self.chk_autolaunch.place(x=16, y=70)
         if config.data["autolaunch"]:
             self.chk_autolaunch.select()
         else:
             self.chk_autolaunch.deselect()
+
+        # Update check button (badge in the footer)
+        self.btn_update = ctk.CTkButton(
+            bottom_frame,
+            text=f"v{VERSION}",
+            width=110,
+            height=18,
+            fg_color="#1a2233",
+            hover_color=self.color_border,
+            text_color=self.color_text_muted,
+            font=ctk.CTkFont(size=9, weight="bold"),
+            corner_radius=9,
+            command=self.check_for_updates_manual
+        )
+        self.btn_update.place(x=235, y=70)
         
         # Master Astro Toggle
         self.switch_master = ctk.CTkSwitch(
@@ -823,7 +854,7 @@ class AstroModeApp(ctk.CTk):
             button_hover_color=self.color_accent_hover,
             command=self.toggle_astro_mode
         )
-        self.switch_master.place(x=235, y=33)
+        self.switch_master.place(x=235, y=38)
 
     def create_card(self, title, description):
         card = ctk.CTkFrame(
@@ -1141,7 +1172,7 @@ class AstroModeApp(ctk.CTk):
     def show_window(self):
         # Default geometry sizes
         w_width = 380
-        w_height = 600
+        w_height = 620
         
         # Position window near bottom-right corner of work area or load remembered position
         if config.data["last_x"] is not None and config.data["last_y"] is not None:
@@ -1169,6 +1200,163 @@ class AstroModeApp(ctk.CTk):
         self.geometry(f"{w_width}x{w_height}+{x}+{y}")
         self.deiconify()
         self.focus_force()
+
+    def check_for_updates_background(self, silent=True):
+        def worker():
+            try:
+                # Add User-Agent header as required by GitHub API
+                req = urllib.request.Request(
+                    "https://api.github.com/repos/Starman42X/astro-mode/releases/latest",
+                    headers={"User-Agent": "AstroMode-Updater"}
+                )
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    data = json.loads(response.read().decode())
+                    
+                tag = data.get("tag_name", "")
+                if not tag:
+                    def no_release_found():
+                        self.btn_update.configure(text=f"v{VERSION}", state="normal")
+                        if not silent:
+                            tk.messagebox.showinfo("AstroMode Update", "No releases found on GitHub yet. You are running the latest version!")
+                    self.after(0, no_release_found)
+                    return
+                    
+                latest_version = tag.lstrip('v')
+                current_version = VERSION.lstrip('v')
+                
+                # Check if tag is different
+                if latest_version != current_version:
+                    # Find exe asset
+                    exe_url = None
+                    for asset in data.get("assets", []):
+                        if asset.get("name", "").endswith(".exe"):
+                            exe_url = asset.get("browser_download_url")
+                            break
+                    
+                    if exe_url:
+                        def notify():
+                            # Highlight button in orange to grab attention!
+                            self.btn_update.configure(
+                                text=f"Update to {tag}", 
+                                fg_color=self.color_accent,
+                                hover_color=self.color_accent_hover,
+                                text_color="#ffffff",
+                                state="normal",
+                                command=lambda: self.start_update(exe_url, tag)
+                            )
+                        self.after(0, notify)
+                        return
+                
+                def no_update():
+                    self.btn_update.configure(text=f"v{VERSION}", state="normal")
+                    if not silent:
+                        tk.messagebox.showinfo("AstroMode Update", "You are running the latest version!")
+                self.after(0, no_update)
+                
+            except urllib.error.HTTPError as e:
+                print(f"HTTP Error checking for updates: {e.code} - {e.reason}")
+                if e.code == 404:
+                    # No releases published yet
+                    def no_release():
+                        self.btn_update.configure(text=f"v{VERSION}", state="normal")
+                        if not silent:
+                            tk.messagebox.showinfo("AstroMode Update", "No releases found on GitHub yet. You are running the latest version!")
+                    self.after(0, no_release)
+                else:
+                    def report_http_error():
+                        self.btn_update.configure(text="Check Failed", state="normal")
+                        if not silent:
+                            tk.messagebox.showerror("Update Error", f"HTTP Error {e.code}: {e.reason}")
+                        # Revert back to version tag after 3 seconds
+                        self.after(3000, lambda: self.btn_update.configure(text=f"v{VERSION}"))
+                    self.after(0, report_http_error)
+            except Exception as e:
+                print(f"Error checking for updates: {e}")
+                def report_error():
+                    self.btn_update.configure(text="Check Failed", state="normal")
+                    if not silent:
+                        tk.messagebox.showerror("Update Error", f"Failed to check for updates:\n{e}")
+                    self.after(3000, lambda: self.btn_update.configure(text=f"v{VERSION}"))
+                self.after(0, report_error)
+                    
+        threading.Thread(target=worker, daemon=True).start()
+
+    def check_for_updates_manual(self):
+        self.btn_update.configure(text="Checking...", state="disabled")
+        self.check_for_updates_background(silent=False)
+
+    def start_update(self, exe_url, version_tag):
+        self.btn_update.configure(state="disabled", text="Downloading...")
+        
+        def worker():
+            try:
+                # If running in python development mode (not frozen), simulate the update
+                if not getattr(sys, 'frozen', False):
+                    def dev_notify():
+                        tk.messagebox.showinfo(
+                            "AstroMode Update (Dev Mode)",
+                            f"Update simulated in developer mode.\n"
+                            f"New Version: {version_tag}\n"
+                            f"Download URL: {exe_url}"
+                        )
+                        # Reset button back to default
+                        self.btn_update.configure(
+                            text=f"v{VERSION}",
+                            state="normal",
+                            fg_color="#1a2233",
+                            hover_color=self.color_border,
+                            text_color=self.color_text_muted,
+                            command=self.check_for_updates_manual
+                        )
+                    self.after(0, dev_notify)
+                    return
+                
+                exe_path = sys.executable
+                exe_dir = os.path.dirname(exe_path)
+                new_exe_path = os.path.join(exe_dir, "AstroMode_new.exe")
+                
+                # Download new executable file
+                req = urllib.request.Request(exe_url, headers={"User-Agent": "AstroMode-Updater"})
+                with urllib.request.urlopen(req) as response:
+                    with open(new_exe_path, "wb") as f:
+                        f.write(response.read())
+                
+                # Detached PowerShell execution script
+                pid = os.getpid()
+                exe_name = os.path.basename(exe_path)
+                
+                ps_script = f"""
+                Start-Sleep -Seconds 1
+                $count = 0
+                while ((Get-Process -Id {pid} -ErrorAction SilentlyContinue) -and ($count -lt 10)) {{
+                    Start-Sleep -Milliseconds 200
+                    $count++
+                }}
+                Remove-Item -Path "{exe_path}" -Force -ErrorAction SilentlyContinue
+                Rename-Item -Path "{new_exe_path}" -NewName "{exe_name}" -Force
+                Start-Process -FilePath "{exe_path}"
+                """
+                
+                # Spawn PowerShell in background with hidden window and no console window
+                cmd = ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script]
+                subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
+                
+                # Shutdown current app immediately to release file lock
+                self.after(0, self.on_exit)
+                
+            except Exception as e:
+                def report_error(err_msg=str(e)):
+                    tk.messagebox.showerror("Update Error", f"Failed to install update:\n{err_msg}")
+                    self.btn_update.configure(
+                        text=f"Update to {version_tag}",
+                        fg_color=self.color_accent,
+                        hover_color=self.color_accent_hover,
+                        text_color="#ffffff",
+                        state="normal"
+                    )
+                self.after(0, report_error)
+                
+        threading.Thread(target=worker, daemon=True).start()
 
     def hide_window(self):
         self.withdraw()

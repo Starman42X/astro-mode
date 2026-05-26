@@ -1,0 +1,25 @@
+# PyInstaller build files
+build/
+dist/
+*.spec
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Application config / restore state (local testing)
+config.json
+restore_state.json
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# System / IDE files
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
