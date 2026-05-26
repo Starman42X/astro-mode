@@ -15,7 +15,7 @@ import winreg
 import urllib.request
 import urllib.error
 
-VERSION = "1.0.3"
+VERSION = "1.0.0"
 
 
 def is_newer_version(latest, current):
