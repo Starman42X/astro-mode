@@ -15,7 +15,7 @@ import winreg
 import urllib.request
 import urllib.error
 
-VERSION = "1.0.0"
+VERSION = "1.0.3"
 
 
 def is_newer_version(latest, current):
@@ -1285,8 +1285,8 @@ class AstroModeApp(ctk.CTk):
                     self.after(0, no_release_found)
                     return
                     
-                latest_version = tag.lstrip('v')
-                current_version = VERSION.lstrip('v')
+                latest_version = tag.lstrip('v').strip()
+                current_version = VERSION.lstrip('v').strip()
                 
                 # Check if tag is newer using semantic versioning
                 if is_newer_version(latest_version, current_version):
@@ -1444,23 +1444,57 @@ class AstroModeApp(ctk.CTk):
                 pid = os.getpid()
                 exe_name = os.path.basename(exe_path)
                 
+                # Escape paths for PowerShell double-quoted strings
+                exe_path_ps = exe_path.replace('$', '`$').replace('"', '`"')
+                new_exe_path_ps = new_exe_path.replace('$', '`$').replace('"', '`"')
+                exe_dir_ps = exe_dir.replace('$', '`$').replace('"', '`"')
+                mei_path = getattr(sys, '_MEIPASS', '')
+                
                 ps_script = f"""
+                $env:PYINSTALLER_RESET_ENVIRONMENT = "1"
                 Remove-Item env:_MEIPASS -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 1
-                $count = 0
-                while ((Get-Process -Id {pid} -ErrorAction SilentlyContinue) -and ($count -lt 10)) {{
-                    Start-Sleep -Milliseconds 200
-                    $count++
+                Remove-Item env:_MEIPASS2 -ErrorAction SilentlyContinue
+                if ("{mei_path}") {{
+                    $env:PATH = ($env:PATH -split ';' | Where-Object {{ $_ -ne "{mei_path}" }}) -join ';'
                 }}
-                Remove-Item -Path "{exe_path}" -Force -ErrorAction SilentlyContinue
-                Rename-Item -Path "{new_exe_path}" -NewName "{exe_name}" -Force
-                Start-Process -FilePath "{exe_path}"
+                
+                # Wait for parent PID to exit (up to 15 seconds)
+                $proc = Get-Process -Id {pid} -ErrorAction SilentlyContinue
+                if ($proc) {{
+                    $proc | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
+                }}
+                
+                # Try to replace the executable with retries (up to 10 times, 500ms apart)
+                $replaced = $false
+                for ($i = 0; $i -lt 10; $i++) {{
+                    try {{
+                        if (Test-Path "{exe_path_ps}") {{
+                            Remove-Item -Path "{exe_path_ps}" -Force -ErrorAction Stop
+                        }}
+                        Rename-Item -Path "{new_exe_path_ps}" -NewName "{exe_name}" -Force -ErrorAction Stop
+                        $replaced = $true
+                        break
+                    }} catch {{
+                        Start-Sleep -Milliseconds 500
+                    }}
+                }}
+                
+                if ($replaced) {{
+                    (New-Object -ComObject Shell.Application).ShellExecute("{exe_path_ps}", "", "{exe_dir_ps}")
+                }}
                 """
                 
                 # Spawn PowerShell in background with hidden window and no console window
                 cmd = ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script]
                 env = os.environ.copy()
                 env.pop("_MEIPASS", None)
+                env.pop("_MEIPASS2", None)
+                if "PATH" in env and mei_path:
+                    paths = env["PATH"].split(os.pathsep)
+                    paths = [p for p in paths if p.strip().lower() != mei_path.lower()]
+                    env["PATH"] = os.pathsep.join(paths)
+                env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+                
                 subprocess.Popen(cmd, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
                 
                 # Shutdown current app immediately to release file lock
