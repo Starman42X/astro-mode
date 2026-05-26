@@ -135,7 +135,8 @@ class AstroConfig:
             "prevent_shutdown_enabled": True,
             "display_timeout_enabled": True,
             "display_timeout_value": "Never",
-            "usb_power_enabled": True
+            "usb_power_enabled": True,
+            "lid_close_enabled": True
         }
         self.load()
 
@@ -344,6 +345,28 @@ def set_usb_settings(ac_val, dc_val):
         print(f"Error setting USB selective suspend: {e}")
         return False
 
+# 8. Lid Close Action (powercfg)
+def get_lid_close_settings():
+    try:
+        output = subprocess.check_output("powercfg /query SCHEME_CURRENT SUB_BUTTONS LIDCLOSE", shell=True, text=True, stderr=subprocess.DEVNULL)
+        ac_match = re.search(r"Current AC Power Setting Index:\s+(0x[0-9a-fA-F]+)", output)
+        dc_match = re.search(r"Current DC Power Setting Index:\s+(0x[0-9a-fA-F]+)", output)
+        ac_val = int(ac_match.group(1), 16) if ac_match else 1
+        dc_val = int(dc_match.group(1), 16) if dc_match else 1
+        return ac_val, dc_val
+    except Exception:
+        return None
+
+def set_lid_close_settings(ac_val, dc_val):
+    try:
+        subprocess.run(f"powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDCLOSE {ac_val}", shell=True, check=True)
+        subprocess.run(f"powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDCLOSE {dc_val}", shell=True, check=True)
+        subprocess.run("powercfg /setactive SCHEME_CURRENT", shell=True, check=True)
+        return True
+    except Exception as e:
+        print(f"Error setting lid close action: {e}")
+        return False
+
 
 # ==============================================================================
 # STATE BACKUP AND CRASH RECOVERY
@@ -426,6 +449,11 @@ class AstroStateManager:
         orig_usb = self.get_original_value("usb_selective_suspend")
         if orig_usb is not None:
             set_usb_settings(orig_usb[0], orig_usb[1])
+
+        # 8. Restore Lid Close Action
+        orig_lid = self.get_original_value("lid_close_action")
+        if orig_lid is not None:
+            set_lid_close_settings(orig_lid[0], orig_lid[1])
 
         # 7. Restore Gamma Ramp
         # Gamma ramp is restored by setting a standard linear ramp
@@ -792,6 +820,15 @@ class AstroModeApp(ctk.CTk):
         )
         self.chk_usb.pack(anchor="w", padx=10, pady=(5, 8))
 
+        # Card 8: Lid Close Action
+        self.card_lid = self.create_card("Lid Close Action", "do nothing when the laptop lid is closed (prevents sleep/shutdown)")
+        self.chk_lid = ctk.CTkCheckBox(
+            self.card_lid, text="Force Lid Close to 'Do Nothing'", font=ctk.CTkFont(weight="bold"),
+            text_color=self.color_text_main, border_color=self.color_accent,
+            fg_color=self.color_accent, hover_color=self.color_accent_hover, command=self.on_setting_changed
+        )
+        self.chk_lid.pack(anchor="w", padx=10, pady=(5, 8))
+
         # 3. Bottom Panel (Master Astro Switch, Power Status, and Autolaunch Option)
         bottom_frame = ctk.CTkFrame(self, height=110, corner_radius=0, fg_color=self.color_card, border_width=1, border_color=self.color_border)
         bottom_frame.pack(fill="x", side="bottom")
@@ -909,6 +946,11 @@ class AstroModeApp(ctk.CTk):
         if config.data["usb_power_enabled"]: self.chk_usb.select()
         else: self.chk_usb.deselect()
 
+        if config.data.get("lid_close_enabled", True): self.chk_lid.select()
+        else: self.chk_lid.deselect()
+        if get_lid_close_settings() is None:
+            self.chk_lid.configure(state="disabled", text="Lid Close Action (Not Supported)")
+
     def on_autolaunch_toggled(self):
         val = self.chk_autolaunch.get() == 1
         config.data["autolaunch"] = val
@@ -937,6 +979,7 @@ class AstroModeApp(ctk.CTk):
         config.data["prevent_shutdown_enabled"] = self.chk_shutdown.get() == 1
         config.data["display_timeout_enabled"] = self.chk_timeout.get() == 1
         config.data["usb_power_enabled"] = self.chk_usb.get() == 1
+        config.data["lid_close_enabled"] = self.chk_lid.get() == 1
         config.save()
 
         # If Astro Mode is currently active, we want to immediately apply
@@ -1138,6 +1181,20 @@ class AstroModeApp(ctk.CTk):
             if orig_usb is not None:
                 set_usb_settings(orig_usb[0], orig_usb[1])
                 state_manager.backup_data.pop("usb_selective_suspend", None)
+                state_manager.save_backup()
+
+        # 8. Lid Close Action
+        if self.chk_lid.get() and get_lid_close_settings() is not None:
+            active_features.add("lid_close")
+            ac_lid, dc_lid = get_lid_close_settings()
+            if state_manager.get_original_value("lid_close_action") is None:
+                state_manager.save_original_value("lid_close_action", (ac_lid, dc_lid))
+            set_lid_close_settings(0, 0) # 0 = Do Nothing
+        else:
+            orig_lid = state_manager.get_original_value("lid_close_action")
+            if orig_lid is not None:
+                set_lid_close_settings(orig_lid[0], orig_lid[1])
+                state_manager.backup_data.pop("lid_close_action", None)
                 state_manager.save_backup()
 
         # Update backup state on disk
