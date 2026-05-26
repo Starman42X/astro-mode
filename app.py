@@ -1445,6 +1445,7 @@ class AstroModeApp(ctk.CTk):
                 exe_name = os.path.basename(exe_path)
                 
                 ps_script = f"""
+                Remove-Item env:_MEIPASS -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 1
                 $count = 0
                 while ((Get-Process -Id {pid} -ErrorAction SilentlyContinue) -and ($count -lt 10)) {{
@@ -1458,7 +1459,9 @@ class AstroModeApp(ctk.CTk):
                 
                 # Spawn PowerShell in background with hidden window and no console window
                 cmd = ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script]
-                subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
+                env = os.environ.copy()
+                env.pop("_MEIPASS", None)
+                subprocess.Popen(cmd, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
                 
                 # Shutdown current app immediately to release file lock
                 self.after(0, self.on_exit)
