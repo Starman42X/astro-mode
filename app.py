@@ -18,6 +18,17 @@ import urllib.error
 VERSION = "1.0.0"
 
 
+def is_newer_version(latest, current):
+    try:
+        latest_parts = [int(x) for x in re.findall(r'\d+', latest)]
+        current_parts = [int(x) for x in re.findall(r'\d+', current)]
+        max_len = max(len(latest_parts), len(current_parts))
+        latest_parts += [0] * (max_len - len(latest_parts))
+        current_parts += [0] * (max_len - len(current_parts))
+        return latest_parts > current_parts
+    except Exception:
+        return latest != current
+
 # ==============================================================================
 # WINDOWS API DECLARATIONS
 # ==============================================================================
@@ -496,16 +507,7 @@ class AstroModeApp(ctk.CTk):
         
         # Load restore backup if it exists from previous crash
         if state_manager.load_backup():
-            # Ask the user if they want to restore settings
-            msg_box = tk.messagebox.askyesno(
-                "AstroMode Recovery",
-                "It looks like AstroMode closed unexpectedly last time.\n\n"
-                "Would you like to restore your laptop settings to their original state?"
-            )
-            if msg_box:
-                state_manager.restore_system_settings()
-            else:
-                state_manager.clear_backup()
+            self.after(500, self.check_recovery)
 
         # UI Styling (Gaia Pillars Cosmic Palette)
         ctk.set_appearance_mode("dark")
@@ -541,8 +543,9 @@ class AstroModeApp(ctk.CTk):
         # Get HWND and set subclass WndProc for blocking shutdown
         self.after(200, self.init_win32_hooks)
         
-        # Intercept FocusOut to hide window
+        # Intercept FocusOut and FocusIn to handle overlaying instead of minimizing
         self.bind("<FocusOut>", self.on_focus_out)
+        self.bind("<FocusIn>", self.on_focus_in)
         
         # Initialize UI widgets state from current system settings
         self.sync_ui_with_system()
@@ -552,8 +555,8 @@ class AstroModeApp(ctk.CTk):
         self.power_thread = threading.Thread(target=self.monitor_power_loop, daemon=True)
         self.power_thread.start()
 
-        # Check for updates in the background on startup
-        self.check_for_updates_background(silent=True)
+        # Check for updates on startup (startup=True asks user if update is found, silent on no update)
+        self.check_for_updates_background(silent=True, startup=True)
 
     def init_win32_hooks(self):
         # Retrieve HWND of the Tkinter root window safely using wm_frame()
@@ -1256,9 +1259,10 @@ class AstroModeApp(ctk.CTk):
             
         self.geometry(f"{w_width}x{w_height}+{x}+{y}")
         self.deiconify()
+        self.attributes("-topmost", True) # Make sure it starts topmost
         self.focus_force()
 
-    def check_for_updates_background(self, silent=True):
+    def check_for_updates_background(self, silent=True, startup=False):
         def worker():
             try:
                 # Add User-Agent header as required by GitHub API
@@ -1273,16 +1277,19 @@ class AstroModeApp(ctk.CTk):
                 if not tag:
                     def no_release_found():
                         self.btn_update.configure(text=f"v{VERSION}", state="normal")
-                        if not silent:
-                            tk.messagebox.showinfo("AstroMode Update", "No releases found on GitHub yet. You are running the latest version!")
+                        if not silent and not startup:
+                            self.show_custom_dialog(
+                                title="AstroMode Update",
+                                message="No releases found on GitHub yet. You are running the latest version!"
+                            )
                     self.after(0, no_release_found)
                     return
                     
                 latest_version = tag.lstrip('v')
                 current_version = VERSION.lstrip('v')
                 
-                # Check if tag is different
-                if latest_version != current_version:
+                # Check if tag is newer using semantic versioning
+                if is_newer_version(latest_version, current_version):
                     # Find exe asset
                     exe_url = None
                     for asset in data.get("assets", []):
@@ -1301,38 +1308,94 @@ class AstroModeApp(ctk.CTk):
                                 state="normal",
                                 command=lambda: self.start_update(exe_url, tag)
                             )
+                            # If startup or manual check, prompt user
+                            if startup or not silent:
+                                self.show_custom_dialog(
+                                    title="Update Available",
+                                    message=f"A new version ({tag}) of AstroMode is available.\n\nWould you like to download and install it now?",
+                                    confirm_text="Update Now",
+                                    cancel_text="Later",
+                                    on_confirm=lambda: self.start_update(exe_url, tag)
+                                )
                         self.after(0, notify)
+                        return
+                    else:
+                        def notify_no_exe():
+                            self.btn_update.configure(text=f"New Release: {tag}", state="disabled")
+                            if startup or not silent:
+                                self.show_custom_dialog(
+                                    title="Release Asset Missing",
+                                    message=f"A new version ({tag}) is available on GitHub, but no executable (.exe) was found in the release assets.\n\nPlease verify that the executable is attached to the GitHub release.",
+                                    confirm_text="OK"
+                                )
+                        self.after(0, notify_no_exe)
                         return
                 
                 def no_update():
                     self.btn_update.configure(text=f"v{VERSION}", state="normal")
-                    if not silent:
-                        tk.messagebox.showinfo("AstroMode Update", "You are running the latest version!")
+                    if not silent and not startup:
+                        self.show_custom_dialog(
+                            title="AstroMode Update",
+                            message="You are running the latest version of AstroMode!"
+                        )
                 self.after(0, no_update)
                 
             except urllib.error.HTTPError as e:
                 print(f"HTTP Error checking for updates: {e.code} - {e.reason}")
                 if e.code == 404:
-                    # No releases published yet
-                    def no_release():
-                        self.btn_update.configure(text=f"v{VERSION}", state="normal")
-                        if not silent:
-                            tk.messagebox.showinfo("AstroMode Update", "No releases found on GitHub yet. You are running the latest version!")
-                    self.after(0, no_release)
+                    # Let's verify if the repository itself exists/is public
+                    repo_exists = False
+                    try:
+                        req_repo = urllib.request.Request(
+                            "https://api.github.com/repos/Starman42X/astro-mode",
+                            headers={"User-Agent": "AstroMode-Updater"}
+                        )
+                        with urllib.request.urlopen(req_repo, timeout=5) as resp:
+                            if resp.status == 200:
+                                repo_exists = True
+                    except Exception:
+                        pass
+                        
+                    if repo_exists:
+                        # Repository is public but simply has no releases yet
+                        def no_release():
+                            self.btn_update.configure(text=f"v{VERSION}", state="normal")
+                            if not silent and not startup:
+                                self.show_custom_dialog(
+                                    title="AstroMode Update",
+                                    message="No releases found on GitHub yet. You are running the latest version!"
+                                )
+                        self.after(0, no_release)
+                    else:
+                        # Repository is private or does not exist
+                        def repo_private():
+                            self.btn_update.configure(text="Check Failed", state="normal")
+                            if not silent and not startup:
+                                self.show_custom_dialog(
+                                    title="Update Check Failed",
+                                    message="The repository 'Starman42X/astro-mode' is private or not found (404).\n\nPlease ensure your GitHub repository is set to 'Public' so that the updater can check and download releases."
+                                )
+                            self.after(3000, lambda: self.btn_update.configure(text=f"v{VERSION}"))
+                        self.after(0, repo_private)
                 else:
                     def report_http_error():
                         self.btn_update.configure(text="Check Failed", state="normal")
-                        if not silent:
-                            tk.messagebox.showerror("Update Error", f"HTTP Error {e.code}: {e.reason}")
-                        # Revert back to version tag after 3 seconds
+                        if not silent and not startup:
+                            self.show_custom_dialog(
+                                title="Update Error",
+                                message=f"HTTP Error {e.code}: {e.reason}"
+                            )
                         self.after(3000, lambda: self.btn_update.configure(text=f"v{VERSION}"))
                     self.after(0, report_http_error)
             except Exception as e:
                 print(f"Error checking for updates: {e}")
                 def report_error():
                     self.btn_update.configure(text="Check Failed", state="normal")
-                    if not silent:
-                        tk.messagebox.showerror("Update Error", f"Failed to check for updates:\n{e}")
+                    if not silent and not startup:
+                        self.show_custom_dialog(
+                            title="Update Error",
+                            message=f"Failed to check for updates:\n\n{e}"
+                        )
                     self.after(3000, lambda: self.btn_update.configure(text=f"v{VERSION}"))
                 self.after(0, report_error)
                     
@@ -1350,11 +1413,10 @@ class AstroModeApp(ctk.CTk):
                 # If running in python development mode (not frozen), simulate the update
                 if not getattr(sys, 'frozen', False):
                     def dev_notify():
-                        tk.messagebox.showinfo(
-                            "AstroMode Update (Dev Mode)",
-                            f"Update simulated in developer mode.\n"
-                            f"New Version: {version_tag}\n"
-                            f"Download URL: {exe_url}"
+                        self.show_custom_dialog(
+                            title="Update Simulated",
+                            message=f"Update simulated in developer mode.\n\nNew Version: {version_tag}\nDownload URL: {exe_url}",
+                            confirm_text="OK"
                         )
                         # Reset button back to default
                         self.btn_update.configure(
@@ -1403,7 +1465,11 @@ class AstroModeApp(ctk.CTk):
                 
             except Exception as e:
                 def report_error(err_msg=str(e)):
-                    tk.messagebox.showerror("Update Error", f"Failed to install update:\n{err_msg}")
+                    self.show_custom_dialog(
+                        title="Update Error",
+                        message=f"Failed to install update:\n\n{err_msg}",
+                        confirm_text="OK"
+                    )
                     self.btn_update.configure(
                         text=f"Update to {version_tag}",
                         fg_color=self.color_accent,
@@ -1418,17 +1484,133 @@ class AstroModeApp(ctk.CTk):
     def hide_window(self):
         self.withdraw()
 
+    def show_custom_dialog(self, title, message, confirm_text="OK", cancel_text=None, on_confirm=None, on_cancel=None):
+        # If there is already a dialog open, destroy it first
+        if hasattr(self, "custom_dialog_frame") and self.custom_dialog_frame:
+            try:
+                self.custom_dialog_frame.destroy()
+            except Exception:
+                pass
+
+        # Create dimming background cover to make the overlay stand out
+        # We use a very dark solid color matching the cosmic background
+        dialog_cover = ctk.CTkFrame(self, fg_color="#04060a")
+        dialog_cover.place(x=0, y=0, relwidth=1, relheight=1)
+        
+        # Bind mouse clicks to prevent interacting with background widgets
+        dialog_cover.bind("<Button-1>", lambda e: "break")
+
+        # Dialog Box Container
+        dialog_box = ctk.CTkFrame(
+            dialog_cover, 
+            fg_color=self.color_card, 
+            border_width=2, 
+            border_color=self.color_accent,
+            corner_radius=16,
+            width=320,
+            height=200
+        )
+        dialog_box.place(relx=0.5, rely=0.5, anchor="center")
+        dialog_box.pack_propagate(False)
+
+        # Dialog Title
+        lbl_title = ctk.CTkLabel(
+            dialog_box, 
+            text=title, 
+            font=ctk.CTkFont(size=14, weight="bold"), 
+            text_color=self.color_text_main
+        )
+        lbl_title.pack(pady=(15, 10), padx=15)
+
+        # Dialog Message
+        lbl_msg = ctk.CTkLabel(
+            dialog_box, 
+            text=message, 
+            font=ctk.CTkFont(size=11), 
+            text_color=self.color_text_muted,
+            wraplength=280,
+            justify="center"
+        )
+        lbl_msg.pack(pady=(0, 15), padx=15, fill="both", expand=True)
+
+        # Buttons Frame
+        btn_frame = ctk.CTkFrame(dialog_box, fg_color="transparent")
+        btn_frame.pack(side="bottom", fill="x", pady=(0, 15), padx=15)
+
+        def close_dialog():
+            dialog_cover.destroy()
+            self.custom_dialog_frame = None
+
+        def handle_confirm():
+            close_dialog()
+            if on_confirm:
+                on_confirm()
+
+        def handle_cancel():
+            close_dialog()
+            if on_cancel:
+                on_cancel()
+
+        # Cancel Button
+        if cancel_text:
+            btn_cancel = ctk.CTkButton(
+                btn_frame,
+                text=cancel_text,
+                fg_color="#1a2233",
+                hover_color=self.color_border,
+                text_color=self.color_text_muted,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                height=32,
+                corner_radius=8,
+                command=handle_cancel
+            )
+            btn_cancel.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        # Confirm Button
+        btn_confirm = ctk.CTkButton(
+            btn_frame,
+            text=confirm_text,
+            fg_color=self.color_accent,
+            hover_color=self.color_accent_hover,
+            text_color="#ffffff",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            height=32,
+            corner_radius=8,
+            command=handle_confirm
+        )
+        if cancel_text:
+            btn_confirm.pack(side="right", fill="x", expand=True, padx=(5, 0))
+        else:
+            btn_confirm.pack(fill="x", expand=True)
+
+        self.custom_dialog_frame = dialog_cover
+
+    def check_recovery(self):
+        self.show_custom_dialog(
+            title="AstroMode Recovery",
+            message="It looks like AstroMode closed unexpectedly last time.\n\nWould you like to restore your laptop settings to their original state?",
+            confirm_text="Restore Settings",
+            cancel_text="Keep Settings",
+            on_confirm=state_manager.restore_system_settings,
+            on_cancel=state_manager.clear_backup
+        )
+
     def on_focus_out(self, event):
-        # Only close on focus out if the user clicks completely outside of the window widgets,
-        # and the window is visible.
-        # Tkinter generates a FocusOut event when dropdown menus/option menus open,
-        # so we check if the focus went to a child widget or another app.
+        # We only want to remove topmost if the active window is not our window.
+        # This prevents losing topmost when clicking empty spaces or dragging the window.
+        self.after(50, self._check_focus_lost)
+
+    def _check_focus_lost(self):
         try:
-            focus_widget = self.focus_get()
-            if focus_widget is None:
-                self.hide_window()
+            foreground_hwnd = ctypes.windll.user32.GetForegroundWindow()
+            if self.hwnd and foreground_hwnd != self.hwnd:
+                # Focus has actually left our application
+                self.attributes("-topmost", False)
         except Exception:
-            self.hide_window()
+            self.attributes("-topmost", False)
+
+    def on_focus_in(self, event):
+        self.attributes("-topmost", True)
 
     # ==============================================================================
     # POWER STATUS MONITOR THREAD
