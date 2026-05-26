@@ -15,7 +15,33 @@ import winreg
 import urllib.request
 import urllib.error
 
-VERSION = "1.0.0"
+def get_version():
+    if getattr(sys, 'frozen', False):
+        try:
+            version_path = os.path.join(getattr(sys, '_MEIPASS', ''), 'version.txt')
+            with open(version_path, 'r') as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    else:
+        # Check if local version.txt exists in the app directory first
+        local_version_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'version.txt')
+        if os.path.exists(local_version_path):
+            try:
+                with open(local_version_path, 'r') as f:
+                    return f.read().strip()
+            except Exception:
+                pass
+        try:
+            tag = subprocess.check_output("git describe --tags --abbrev=0", shell=True, text=True, stderr=subprocess.DEVNULL).strip()
+            if tag.startswith('v'):
+                tag = tag[1:]
+            return tag
+        except Exception:
+            pass
+    return "1.0.0"
+
+VERSION = get_version()
 
 
 def is_newer_version(latest, current):
@@ -1036,9 +1062,9 @@ class AstroModeApp(ctk.CTk):
         self.lbl_cpu_val.configure(text=f"{int(val)}%")
         config.data["cpu_limit_max"] = int(val)
         config.save()
-        # Live update if Astro Mode is active
+        # Live update if Astro Mode is active (run in background thread to prevent lag)
         if self.astro_mode_active and self.chk_cpu.get():
-            set_cpu_limits(int(val))
+            threading.Thread(target=set_cpu_limits, args=(int(val),), daemon=True).start()
 
     def on_setting_changed(self):
         # Save check states to config
@@ -1067,17 +1093,17 @@ class AstroModeApp(ctk.CTk):
     def update_brightness_live(self, val):
         config.data["dim_display_target"] = int(val)
         config.save()
-        # Live update brightness if it is active
+        # Live update brightness if it is active (run in background thread to prevent lag)
         if self.astro_mode_active and self.chk_dim.get():
-            set_system_brightness(int(val))
+            threading.Thread(target=set_system_brightness, args=(int(val),), daemon=True).start()
 
     def on_timeout_combo_changed(self, val):
         config.data["display_timeout_value"] = val
         config.save()
-        # Live update display timeout if active
+        # Live update display timeout if active (run in background thread to prevent lag)
         if self.astro_mode_active and self.chk_timeout.get():
             sec = self.get_timeout_seconds(val)
-            set_display_timeouts(sec, sec)
+            threading.Thread(target=set_display_timeouts, args=(sec, sec), daemon=True).start()
 
     def get_timeout_seconds(self, str_val):
         if "Min" in str_val:
@@ -1117,161 +1143,178 @@ class AstroModeApp(ctk.CTk):
             ctypes.windll.user32.ShutdownBlockReasonDestroy(self.hwnd)
 
     def apply_astro_mode_settings(self):
-        """Applies/updates all system configurations based on selected checkboxes."""
+        """Applies/updates all system configurations based on selected checkboxes in a background thread."""
         if not self.astro_mode_active:
             return
 
         print("Applying selected Astro Mode configurations...")
 
-        # Keep a list of currently selected features to check against
-        active_features = set()
+        # Capture UI states in the main thread (Tkinter is not thread-safe for direct widget calls from other threads)
+        ui_states = {
+            "red_filter": self.chk_red_filter.get() == 1,
+            "red_intensity": float(self.slider_intensity.get()),
+            "dim": self.chk_dim.get() == 1,
+            "dim_target": int(self.slider_dim.get()),
+            "cpu": self.chk_cpu.get() == 1,
+            "cpu_limit": int(self.slider_cpu.get()),
+            "sleep": self.chk_sleep.get() == 1,
+            "shutdown": self.chk_shutdown.get() == 1,
+            "timeout": self.chk_timeout.get() == 1,
+            "timeout_val": self.opt_timeout.get(),
+            "usb": self.chk_usb.get() == 1,
+            "lid": self.chk_lid.get() == 1
+        }
 
-        # 1. Red Screen Filter
-        if self.chk_red_filter.get():
-            active_features.add("red_filter")
-        else:
-            # If red filter was turned off individually, restore gamma ramp
-            restore_gamma_linear()
+        def worker():
+            active_features = set()
 
-        # 2. Dim Screen
-        if self.chk_dim.get():
-            active_features.add("dim_display")
-            # Save original brightness before changing
-            orig_b = get_system_brightness()
-            # If we already saved it in this session, don't overwrite
-            if state_manager.get_original_value("brightness") is None:
-                state_manager.save_original_value("brightness", orig_b)
-            set_system_brightness(int(self.slider_dim.get()))
-        else:
-            # Restore brightness if unchecked
-            orig_b = state_manager.get_original_value("brightness")
-            if orig_b is not None:
-                set_system_brightness(orig_b)
-                state_manager.backup_data.pop("brightness", None)
+            # 2. Dim Screen
+            if ui_states["dim"]:
+                active_features.add("dim_display")
+                orig_b = get_system_brightness()
+                if state_manager.get_original_value("brightness") is None:
+                    state_manager.save_original_value("brightness", orig_b)
+                set_system_brightness(ui_states["dim_target"])
+            else:
+                orig_b = state_manager.get_original_value("brightness")
+                if orig_b is not None:
+                    set_system_brightness(orig_b)
+                    state_manager.backup_data.pop("brightness", None)
+                    state_manager.save_backup()
+
+            # 3. CPU Limiter
+            if ui_states["cpu"]:
+                active_features.add("cpu_limit")
+                ac_cpu, dc_cpu = get_cpu_limits()
+                if state_manager.get_original_value("cpu_limits") is None:
+                    state_manager.save_original_value("cpu_limits", (ac_cpu, dc_cpu))
+                    
+                ac_min_cpu, dc_min_cpu = get_min_cpu_limits()
+                if state_manager.get_original_value("min_cpu_limits") is None:
+                    state_manager.save_original_value("min_cpu_limits", (ac_min_cpu, dc_min_cpu))
+                    
+                set_cpu_limits(ui_states["cpu_limit"])
+                set_min_cpu_limits(0)
+            else:
+                orig_cpu = state_manager.get_original_value("cpu_limits")
+                if orig_cpu is not None:
+                    set_cpu_limits(orig_cpu[0])
+                    state_manager.backup_data.pop("cpu_limits", None)
+                    
+                orig_min_cpu = state_manager.get_original_value("min_cpu_limits")
+                if orig_min_cpu is not None:
+                    set_min_cpu_limits(orig_min_cpu[0])
+                    state_manager.backup_data.pop("min_cpu_limits", None)
                 state_manager.save_backup()
 
-        # 3. CPU Limiter
-        if self.chk_cpu.get():
-            active_features.add("cpu_limit")
-            ac_cpu, dc_cpu = get_cpu_limits()
-            if state_manager.get_original_value("cpu_limits") is None:
-                state_manager.save_original_value("cpu_limits", (ac_cpu, dc_cpu))
+            # 4. Never Sleep / Prevent Standby
+            if ui_states["sleep"]:
+                active_features.add("never_sleep")
+                ac_standby, dc_standby = get_standby_timeouts()
+                if state_manager.get_original_value("standby_timeouts") is None:
+                    state_manager.save_original_value("standby_timeouts", (ac_standby, dc_standby))
+                set_standby_timeouts(0, 0)
                 
-            ac_min_cpu, dc_min_cpu = get_min_cpu_limits()
-            if state_manager.get_original_value("min_cpu_limits") is None:
-                state_manager.save_original_value("min_cpu_limits", (ac_min_cpu, dc_min_cpu))
-                
-            set_cpu_limits(int(self.slider_cpu.get()))
-            set_min_cpu_limits(0) # Force min CPU state to 0% to allow max down-throttling
-        else:
-            orig_cpu = state_manager.get_original_value("cpu_limits")
-            if orig_cpu is not None:
-                set_cpu_limits(orig_cpu[0])
-                state_manager.backup_data.pop("cpu_limits", None)
-                
-            orig_min_cpu = state_manager.get_original_value("min_cpu_limits")
-            if orig_min_cpu is not None:
-                set_min_cpu_limits(orig_min_cpu[0])
-                state_manager.backup_data.pop("min_cpu_limits", None)
-                
+                # Prevent standby at OS level
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED)
+            else:
+                orig_standby = state_manager.get_original_value("standby_timeouts")
+                if orig_standby is not None:
+                    set_standby_timeouts(orig_standby[0], orig_standby[1])
+                    state_manager.backup_data.pop("standby_timeouts", None)
+                    state_manager.save_backup()
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+
+            # 5. Prevent Shutdown & Restarts
+            if ui_states["shutdown"]:
+                active_features.add("prevent_shutdown")
+                # Disable automatic hibernate
+                ac_hib, dc_hib = get_hibernate_timeouts()
+                if state_manager.get_original_value("hibernate_timeouts") is None:
+                    state_manager.save_original_value("hibernate_timeouts", (ac_hib, dc_hib))
+                set_hibernate_timeouts(0, 0)
+            else:
+                orig_hib = state_manager.get_original_value("hibernate_timeouts")
+                if orig_hib is not None:
+                    set_hibernate_timeouts(orig_hib[0], orig_hib[1])
+                    state_manager.backup_data.pop("hibernate_timeouts", None)
+                    state_manager.save_backup()
+
+            # 6. Display Timeout Overrides
+            if ui_states["timeout"]:
+                active_features.add("display_timeout")
+                ac_disp, dc_disp = get_display_timeouts()
+                if state_manager.get_original_value("display_timeouts") is None:
+                    state_manager.save_original_value("display_timeouts", (ac_disp, dc_disp))
+                sec = self.get_timeout_seconds(ui_states["timeout_val"])
+                set_display_timeouts(sec, sec)
+            else:
+                orig_disp = state_manager.get_original_value("display_timeouts")
+                if orig_disp is not None:
+                    set_display_timeouts(orig_disp[0], orig_disp[1])
+                    state_manager.backup_data.pop("display_timeouts", None)
+                    state_manager.save_backup()
+
+            # 7. Keep USB Ports Powered
+            if ui_states["usb"]:
+                active_features.add("usb_power")
+                ac_usb, dc_usb = get_usb_settings()
+                if state_manager.get_original_value("usb_selective_suspend") is None:
+                    state_manager.save_original_value("usb_selective_suspend", (ac_usb, dc_usb))
+                set_usb_settings(0, 0)
+            else:
+                orig_usb = state_manager.get_original_value("usb_selective_suspend")
+                if orig_usb is not None:
+                    set_usb_settings(orig_usb[0], orig_usb[1])
+                    state_manager.backup_data.pop("usb_selective_suspend", None)
+                    state_manager.save_backup()
+
+            # 8. Lid Close Action
+            if ui_states["lid"] and get_lid_close_settings() is not None:
+                active_features.add("lid_close")
+                ac_lid, dc_lid = get_lid_close_settings()
+                if state_manager.get_original_value("lid_close_action") is None:
+                    state_manager.save_original_value("lid_close_action", (ac_lid, dc_lid))
+                set_lid_close_settings(0, 0)
+            else:
+                orig_lid = state_manager.get_original_value("lid_close_action")
+                if orig_lid is not None:
+                    set_lid_close_settings(orig_lid[0], orig_lid[1])
+                    state_manager.backup_data.pop("lid_close_action", None)
+                    state_manager.save_backup()
+
+            # Update backup state on disk
             state_manager.save_backup()
 
-        # 4. Never Sleep / Prevent Standby
-        if self.chk_sleep.get():
-            active_features.add("never_sleep")
-            ac_standby, dc_standby = get_standby_timeouts()
-            if state_manager.get_original_value("standby_timeouts") is None:
-                state_manager.save_original_value("standby_timeouts", (ac_standby, dc_standby))
-            set_standby_timeouts(0, 0) # 0 = Never
-            
-            # Prevent standby at OS level
-            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED)
-        else:
-            orig_standby = state_manager.get_original_value("standby_timeouts")
-            if orig_standby is not None:
-                set_standby_timeouts(orig_standby[0], orig_standby[1])
-                state_manager.backup_data.pop("standby_timeouts", None)
-                state_manager.save_backup()
+            # Safe GUI updates back on the main thread
+            def main_thread_update():
+                global _block_shutdown_active
+                if not self.astro_mode_active:
+                    return
+                # Handle Red Screen Filter (must run in main thread for GDI context safety)
+                if ui_states["red_filter"]:
+                    self.apply_red_filter(ui_states["red_intensity"])
+                else:
+                    restore_gamma_linear()
                 
-            # Release OS standby block if no other block is active
-            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
-
-        # 5. Prevent Shutdown & Restarts
-        if self.chk_shutdown.get():
-            active_features.add("prevent_shutdown")
-            global _block_shutdown_active
-            _block_shutdown_active = True
-            if self.hwnd:
-                ctypes.windll.user32.ShutdownBlockReasonCreate(
-                    self.hwnd, 
-                    ctypes.c_wchar_p("Astrophotography run in progress! Please close AstroMode first.")
-                )
+                # Handle Shutdown Block Reason (requires HWND, must run on main thread)
+                if ui_states["shutdown"]:
+                    _block_shutdown_active = True
+                    if self.hwnd:
+                        ctypes.windll.user32.ShutdownBlockReasonCreate(
+                            self.hwnd, 
+                            ctypes.c_wchar_p("Astrophotography run in progress! Please close AstroMode first.")
+                        )
+                else:
+                    _block_shutdown_active = False
+                    if self.hwnd:
+                        ctypes.windll.user32.ShutdownBlockReasonDestroy(self.hwnd)
             
-            # Disable automatic hibernate
-            ac_hib, dc_hib = get_hibernate_timeouts()
-            if state_manager.get_original_value("hibernate_timeouts") is None:
-                state_manager.save_original_value("hibernate_timeouts", (ac_hib, dc_hib))
-            set_hibernate_timeouts(0, 0)
-        else:
-            _block_shutdown_active = False
-            if self.hwnd:
-                ctypes.windll.user32.ShutdownBlockReasonDestroy(self.hwnd)
-                
-            orig_hib = state_manager.get_original_value("hibernate_timeouts")
-            if orig_hib is not None:
-                set_hibernate_timeouts(orig_hib[0], orig_hib[1])
-                state_manager.backup_data.pop("hibernate_timeouts", None)
-                state_manager.save_backup()
+            # Dispatch UI updates and GDI filter changes safely with a slight delay
+            self.after(300, main_thread_update)
 
-        # 6. Display Timeout Overrides
-        if self.chk_timeout.get():
-            active_features.add("display_timeout")
-            ac_disp, dc_disp = get_display_timeouts()
-            if state_manager.get_original_value("display_timeouts") is None:
-                state_manager.save_original_value("display_timeouts", (ac_disp, dc_disp))
-            sec = self.get_timeout_seconds(self.opt_timeout.get())
-            set_display_timeouts(sec, sec)
-        else:
-            orig_disp = state_manager.get_original_value("display_timeouts")
-            if orig_disp is not None:
-                set_display_timeouts(orig_disp[0], orig_disp[1])
-                state_manager.backup_data.pop("display_timeouts", None)
-                state_manager.save_backup()
-
-        # 7. Keep USB Ports Powered
-        if self.chk_usb.get():
-            active_features.add("usb_power")
-            ac_usb, dc_usb = get_usb_settings()
-            if state_manager.get_original_value("usb_selective_suspend") is None:
-                state_manager.save_original_value("usb_selective_suspend", (ac_usb, dc_usb))
-            set_usb_settings(0, 0) # 0 = Disabled
-        else:
-            orig_usb = state_manager.get_original_value("usb_selective_suspend")
-            if orig_usb is not None:
-                set_usb_settings(orig_usb[0], orig_usb[1])
-                state_manager.backup_data.pop("usb_selective_suspend", None)
-                state_manager.save_backup()
-
-        # 8. Lid Close Action
-        if self.chk_lid.get() and get_lid_close_settings() is not None:
-            active_features.add("lid_close")
-            ac_lid, dc_lid = get_lid_close_settings()
-            if state_manager.get_original_value("lid_close_action") is None:
-                state_manager.save_original_value("lid_close_action", (ac_lid, dc_lid))
-            set_lid_close_settings(0, 0) # 0 = Do Nothing
-        else:
-            orig_lid = state_manager.get_original_value("lid_close_action")
-            if orig_lid is not None:
-                set_lid_close_settings(orig_lid[0], orig_lid[1])
-                state_manager.backup_data.pop("lid_close_action", None)
-                state_manager.save_backup()
-
-        # Update backup state on disk
-        state_manager.save_backup()
-
-        # Apply Red Screen Filter last with a slight delay to ensure graphics drivers have settled
-        if self.chk_red_filter.get():
-            self.after(300, lambda: self.apply_red_filter(self.slider_intensity.get()) if (self.astro_mode_active and self.chk_red_filter.get()) else None)
+        # Run worker thread
+        threading.Thread(target=worker, daemon=True).start()
 
     def apply_red_filter(self, intensity):
         hdc = ctypes.windll.user32.GetDC(0)

@@ -29,3 +29,6 @@ ENV/
 .vscode/
 Thumbs.db
 Desktop.ini
+
+# Build script
+build.py
