@@ -207,8 +207,31 @@ def get_system_power_status():
         return ac_status, percent_str
     return "Unknown", "Unknown"
 
-# 2. Monitor Brightness (WMI/PowerShell)
+# 2. Monitor Brightness (WMI/PowerShell/PowerCFG)
 def get_system_brightness():
+    try:
+        # Use raw GUIDs to query Display Brightness from the current power scheme
+        output = subprocess.check_output(
+            "powercfg /query SCHEME_CURRENT 7516b95f-f776-4464-8c53-06167f40cc99 aded5e82-b909-4619-9949-f5d71dac0bcb",
+            shell=True, text=True, stderr=subprocess.DEVNULL
+        )
+        hex_matches = re.findall(r"0x[0-9a-fA-F]+", output)
+        if len(hex_matches) >= 2:
+            # Last two hex values are AC index and DC index
+            ac_val = int(hex_matches[-2], 16)
+            dc_val = int(hex_matches[-1], 16)
+            # Determine which index to return based on the current power status (AC vs DC)
+            status = SYSTEM_POWER_STATUS()
+            if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+                if status.ACLineStatus == 1:
+                    return ac_val
+                else:
+                    return dc_val
+            return ac_val
+    except Exception:
+        pass
+    
+    # Fallback to WMI
     try:
         cmd = "powershell -Command \"(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness).CurrentBrightness\""
         output = subprocess.check_output(cmd, shell=True, text=True).strip()
@@ -218,12 +241,38 @@ def get_system_brightness():
 
 def set_system_brightness(level):
     try:
-        cmd = f"powershell -Command \"Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{{ Timeout = 1; Brightness = {level} }}\""
-        subprocess.run(cmd, shell=True, check=True)
+        # Constrain level to 0-100
+        level = max(0, min(100, level))
+        # Use raw GUIDs to set display brightness for both AC and DC under current scheme
+        subprocess.run(
+            f"powercfg /setacvalueindex SCHEME_CURRENT 7516b95f-f776-4464-8c53-06167f40cc99 aded5e82-b909-4619-9949-f5d71dac0bcb {level}",
+            shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        subprocess.run(
+            f"powercfg /setdcvalueindex SCHEME_CURRENT 7516b95f-f776-4464-8c53-06167f40cc99 aded5e82-b909-4619-9949-f5d71dac0bcb {level}",
+            shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        subprocess.run(
+            "powercfg /setactive SCHEME_CURRENT",
+            shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        # Also invoke WMI call in background as a helper/fallback to immediately enforce it on all display drivers
+        try:
+            cmd = f"powershell -Command \"Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{{ Timeout = 1; Brightness = {level} }}\""
+            subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
         return True
     except Exception as e:
-        print(f"Error setting brightness: {e}")
-        return False
+        print(f"Error setting powercfg brightness: {e}")
+        # Fallback to WMI only
+        try:
+            cmd = f"powershell -Command \"Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{{ Timeout = 1; Brightness = {level} }}\""
+            subprocess.run(cmd, shell=True, check=True)
+            return True
+        except Exception as e2:
+            print(f"Error setting WMI brightness fallback: {e2}")
+            return False
 
 # 3. CPU Power Settings (powercfg)
 def get_cpu_limits():
@@ -359,20 +408,38 @@ def set_usb_settings(ac_val, dc_val):
 # 8. Lid Close Action (powercfg)
 def get_lid_close_settings():
     try:
-        output = subprocess.check_output("powercfg /query SCHEME_CURRENT SUB_BUTTONS LIDCLOSE", shell=True, text=True, stderr=subprocess.DEVNULL)
-        ac_match = re.search(r"Current AC Power Setting Index:\s+(0x[0-9a-fA-F]+)", output)
-        dc_match = re.search(r"Current DC Power Setting Index:\s+(0x[0-9a-fA-F]+)", output)
-        ac_val = int(ac_match.group(1), 16) if ac_match else 1
-        dc_val = int(dc_match.group(1), 16) if dc_match else 1
-        return ac_val, dc_val
+        # First ensure the attribute is visible
+        subprocess.run(
+            "powercfg /attributes 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936 -ATTRIB_HIDE",
+            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        # Use raw GUIDs to avoid alias mismatch
+        output = subprocess.check_output(
+            "powercfg /query SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936",
+            shell=True, text=True, stderr=subprocess.DEVNULL
+        )
+        # Find all hex values at the end of lines in the output
+        hex_matches = re.findall(r"0x[0-9a-fA-F]+", output)
+        if len(hex_matches) >= 2:
+            # The last two hex values are always the Current AC Power Setting Index and Current DC Power Setting Index
+            ac_val = int(hex_matches[-2], 16)
+            dc_val = int(hex_matches[-1], 16)
+            return ac_val, dc_val
     except Exception:
-        return None
+        pass
+    return None
 
 def set_lid_close_settings(ac_val, dc_val):
     try:
-        subprocess.run(f"powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDCLOSE {ac_val}", shell=True, check=True)
-        subprocess.run(f"powercfg /setdcvalueindex SCHEME_CURRENT SUB_BUTTONS LIDCLOSE {dc_val}", shell=True, check=True)
-        subprocess.run("powercfg /setactive SCHEME_CURRENT", shell=True, check=True)
+        # Ensure the attribute is visible
+        subprocess.run(
+            "powercfg /attributes 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936 -ATTRIB_HIDE",
+            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        # Use raw GUIDs to avoid alias mismatch
+        subprocess.run(f"powercfg /setacvalueindex SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936 {ac_val}", shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(f"powercfg /setdcvalueindex SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936 {dc_val}", shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run("powercfg /setactive SCHEME_CURRENT", shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except Exception as e:
         print(f"Error setting lid close action: {e}")
@@ -740,7 +807,7 @@ class AstroModeApp(ctk.CTk):
         lbl_dim = ctk.CTkLabel(dim_frame, text="Target Brightness:", font=ctk.CTkFont(size=11), text_color=self.color_text_muted)
         lbl_dim.pack(side="left", padx=(5, 5))
         self.slider_dim = ctk.CTkSlider(
-            dim_frame, from_=0, to=20, number_of_steps=20,
+            dim_frame, from_=0, to=100, number_of_steps=100,
             button_color=self.color_accent, button_hover_color=self.color_accent_hover,
             progress_color=self.color_accent, fg_color=self.color_bg, command=self.update_brightness_live
         )
@@ -1062,7 +1129,6 @@ class AstroModeApp(ctk.CTk):
         # 1. Red Screen Filter
         if self.chk_red_filter.get():
             active_features.add("red_filter")
-            self.apply_red_filter(self.slider_intensity.get())
         else:
             # If red filter was turned off individually, restore gamma ramp
             restore_gamma_linear()
@@ -1203,12 +1269,17 @@ class AstroModeApp(ctk.CTk):
         # Update backup state on disk
         state_manager.save_backup()
 
+        # Apply Red Screen Filter last with a slight delay to ensure graphics drivers have settled
+        if self.chk_red_filter.get():
+            self.after(300, lambda: self.apply_red_filter(self.slider_intensity.get()) if (self.astro_mode_active and self.chk_red_filter.get()) else None)
+
     def apply_red_filter(self, intensity):
         hdc = ctypes.windll.user32.GetDC(0)
         if hdc:
             red_ramp = RAMP()
             # Blend green and blue channels from normal (at intensity=0.0) to 0 (at intensity=1.0)
-            factor = 1.0 - intensity
+            # Use a quadratic factor for more natural logarithmic human color perception
+            factor = 1.0 - (float(intensity) ** 2)
             for i in range(256):
                 red_ramp.red[i] = int(i * 256)
                 red_ramp.green[i] = int(i * 256 * factor)
@@ -1746,6 +1817,13 @@ def run_tray_icon(app):
 # ENTRY POINT
 # ==============================================================================
 if __name__ == "__main__":
+    # Force Windows to use our custom icon on the taskbar instead of python/generic icon
+    try:
+        myappid = 'Starman42X.AstroMode.1.0'
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except Exception as e:
+        print(f"Failed to set AppUserModelID: {e}")
+
     app = AstroModeApp()
     
     # Hide window by default, let it live in the system tray
